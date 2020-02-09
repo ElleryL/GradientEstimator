@@ -2,6 +2,7 @@ import random
 import torch
 import numpy as np
 from models.vae import VAE
+from itertools import chain
 import matplotlib.pyplot as plt
 
 import argparse
@@ -15,6 +16,10 @@ import torch
 from torch import nn, optim
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
+
+from torch.utils.tensorboard import SummaryWriter
+
+import time
 
 
 parser = argparse.ArgumentParser(description='VAE MNIST Example')
@@ -42,6 +47,7 @@ parser.add_argument('--ablation', action='store_true')
 parser.add_argument("--dataset",type=str,default="mnist")
 parser.add_argument("--cond_distr",type=str,default="bernoulli")
 parser.add_argument("--training",type=int,default=1)
+parser.add_argument("--alpha",type=float,default=None, help="the re-weighted value for wake update")
 parser.add_argument('--load_checkpoint', type=int, default=0,
                     help='if zero, then we train a new model, if 1 we load a model')
 
@@ -91,6 +97,10 @@ else:
 if not os.path.isdir(dir_to_save + "/" + "checkpoints"):
     os.mkdir(dir_to_save + "/" + "checkpoints")
 
+if not os.path.isdir(dir_to_save + "/log_%d"%args.seed):
+    os.mkdir(dir_to_save + "/log_%d"%args.seed)
+
+writer = SummaryWriter(log_dir=dir_to_save + "/log_%d"%args.seed)
 
 if args.dataset == "mnist":
     kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
@@ -108,7 +118,7 @@ if args.dataset == "mnist":
                 z_dim=args.z_dim,k=args.train_k).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-def train(epoch):
+def train_iwae(epoch):
   model.train()
   train_loss = 0
   for batch_idx, (data, _) in enumerate(train_loader):
@@ -116,8 +126,27 @@ def train(epoch):
 
     optimizer.zero_grad()
     x_prime, z, mu, logvar = model(data)
-    loss = model.neg_elbo_iwae(data, x_prime, z, mu, logvar,cond_distr=args.cond_distr)
-    loss.backward()
+    loss = model.neg_elbo_iwae(data, x_prime, z, mu, logvar, cond_distr=args.cond_distr)
+    #loss.backward()
+
+    grad_dec = torch.autograd.grad(loss, model.dec.parameters(),
+                                   retain_graph=True)
+
+    for i, p in enumerate(model.dec.parameters()):
+        p.grad = grad_dec[i].clone()
+
+    grad_enc = torch.autograd.grad(loss,
+                                   chain(model.enc.parameters(), model.mu.parameters(), model.sigma.parameters()))
+    enc_params = chain(model.enc.parameters(), model.mu.parameters(), model.sigma.parameters())
+
+    grad_var = 0  # TODO: compute gradient variance
+    for i, p in enumerate(enc_params):
+        p.grad = grad_enc[i].clone()
+        grad_var += grad_enc[i].clone().detach().pow(2).mean() - grad_enc[i].clone().detach().mean().pow(2)  # squared first moments
+    grad_var /= i
+    #writer.add_scalar('grad_variance/iwae', grad_var, epoch)
+    stats_info["Grads_Var"].append(grad_var)
+
     train_loss += loss.item()
     optimizer.step()
 
@@ -128,10 +157,60 @@ def train(epoch):
           loss.item()))
 
   avg_loss = train_loss / (batch_idx + 1)
+  stats_info["Train_Loss"].append(avg_loss)
   print('====> Epoch: {} Average loss: {:.4f}'.format(
         epoch, avg_loss))
 
   return avg_loss
+
+
+def train_dreg(epoch):
+    model.train()
+    train_loss = 0
+    for batch_idx, (data, _) in enumerate(train_loader):
+        data = data.to(device)
+
+        optimizer.zero_grad()
+        x_prime, z, mu, logvar = model(data)
+        likelihood_loss, infer_loss = model.neg_elbo_dreg(data, x_prime, z, mu, logvar, cond_distr=args.cond_distr)
+
+
+        grad_dec = torch.autograd.grad(likelihood_loss, model.dec.parameters(),retain_graph=True) #TODO: compute gradient variance
+
+        for i,p in enumerate(model.dec.parameters()):
+            p.grad = grad_dec[i].clone()
+
+        grad_enc = torch.autograd.grad(infer_loss, chain(model.enc.parameters(), model.mu.parameters(), model.sigma.parameters()))
+        enc_params = chain(model.enc.parameters(), model.mu.parameters(), model.sigma.parameters())
+
+        grad_var = 0
+        for i,p in enumerate(enc_params):
+            p.grad = grad_enc[i].clone()
+            grad_var += grad_enc[i].clone().detach().pow(2).mean() - grad_enc[i].clone().detach().mean().pow(
+                2)  # squared first moments
+        grad_var /= i
+        #writer.add_scalar('grad_variance/dreg', grad_var, epoch)
+        stats_info["Grads_Var"].append(grad_var)
+
+
+        loss = likelihood_loss
+        train_loss += loss.item()
+        optimizer.step()
+
+        if batch_idx % args.log_interval == 0:
+          print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+              epoch, batch_idx * len(data), len(train_loader.dataset),
+              100. * batch_idx / len(train_loader),
+              loss.item()))
+
+    avg_loss = train_loss / (batch_idx + 1)
+    stats_info["Train_Loss"].append(avg_loss)
+    print('====> Epoch: {} Average loss: {:.4f}'.format(
+            epoch, avg_loss))
+    return avg_loss
+
+
+
 
 
 def test(epoch):
@@ -155,6 +234,7 @@ def test(epoch):
                    './results/sample_' + str(epoch) + '.png')
 
   test_loss /= (i + 1)
+  stats_info["Test_Loss"].append(test_loss)
   print('====> Test set loss: {:.4f}'.format(test_loss))
   return test_loss
 
@@ -172,6 +252,7 @@ if __name__ == "__main__":
             stats_info["cur_epoch"] = checkpoint['stats_info']['cur_epoch']
             stats_info["Train_Loss"] = checkpoint['stats_info']['Train_Loss']
             stats_info["Test_Loss"] = checkpoint['stats_info']['Test_Loss']
+            stats_info["Grads_Var"] = checkpoint['stats_info']['Grads_Var']
 
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
@@ -180,14 +261,16 @@ if __name__ == "__main__":
                                                                                     dir_to_save,args.seed))
             stats_info["Train_Loss"] = []
             stats_info["Test_Loss"] = []
+            stats_info["Grads_Var"] = []
             stats_info["cur_epoch"] = 0
 
+        train = train_dreg if args.dreg else train_iwae
 
+        start_time = time.time()
         for epoch in range(stats_info["cur_epoch"] + 1, stats_info["cur_epoch"] + args.epochs + 1):
             train(epoch)
             if epoch % 1 == 0:
                 test(epoch)
-
         stats_info["cur_epoch"] = epoch
         torch.save({
                 'stats_info': stats_info,
@@ -198,4 +281,5 @@ if __name__ == "__main__":
     else:
         checkpoint = torch.load(dir_to_save + "/" + "checkpoints" + "/model%d" % args.seed)
         model.load_state_dict(checkpoint['model_state_dict'])
+    print("Takes {:.4f} seconds".format(time.time() - start_time))
     print("DONE !")
