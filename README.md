@@ -8,6 +8,6 @@
   volume={abs/1810.04152}
 }
 
-![True](log/toy/true.png?raw=true "True")
+![True](results/loss.png)
 
 https://arxiv.org/abs/1810.04152
